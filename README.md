@@ -1,232 +1,247 @@
 # lru-cache
 
-This repository implements an LRU (Least Recently Used) cache in Java.
+This document provides an industry-oriented system design for an LRU (Least Recently Used) cache. It focuses on architecture, operational considerations, real-world usage examples, metrics, scaling, and trade-offs. It intentionally does not include implementation code — we'll generate source files separately when you're ready.
 
 ## Table of contents
 
-- What is an LRU Cache?
-- Why use an LRU Cache?
-- Design goals and constraints
-- High-level system design
-- Data structures & algorithm
-- Java implementation
-- Complexity
-- Concurrency considerations
-- Testing & validation
-- Extensions & improvements
+- Overview
+- When to use LRU (industry examples)
+- Goals, constraints, and non-goals
+- Core API and semantics
+- System components and high-level architecture
+- Eviction strategy rationale and alternatives
+- Capacity planning and sizing examples
+- Distributed designs and scaling patterns
+- Operational concerns: metrics, monitoring, and SLAs
+- Failure modes and mitigation
 - Flow diagrams (Mermaid)
+- Next steps
 
-## What is an LRU Cache?
+## Overview
 
-An LRU cache is a fixed-size cache that evicts the least recently used item when capacity is exceeded. It provides fast access and bounded memory usage while keeping recently accessed items available.
+An LRU cache is an in-memory store that keeps a bounded number of items and evicts the least recently used item when capacity is exceeded. LRU is a good fit when the working set exhibits temporal locality (recently accessed items are likely to be accessed again).
 
-## Why use an LRU Cache?
+This document treats the cache as a component within larger systems (web services, CDNs, databases) and explains how to design it for production use.
 
-- Improve performance by caching expensive or frequently accessed results (DB rows, computed values, disk reads).
-- Bounded memory usage with a deterministic eviction policy.
-- Works well when recent accesses are more likely to be accessed again (temporal locality).
+## When to use LRU (industry examples)
 
-## Design goals and constraints
+1. API response caching at the application edge
+   - Cache recent API responses to reduce backend load and latency for high-read traffic.
+   - Example: caching user profile fetches for interactive web requests.
 
-- O(1) average time complexity for get(key) and put(key, value).
-- Bounded memory: fixed capacity.
-- Deterministic eviction using LRU policy.
-- Clear API for get/put/remove/clear/size.
-- Safe for single-threaded use by default; optionally thread-safe for concurrent environments.
+2. Database query result caching
+   - Cache expensive read-only query results to reduce DB CPU/IO.
+   - Example: denormalized read model or report queries where freshness requirements are relaxed.
 
-## High-level system design
+3. CDN / Edge cache (per-node LRU)
+   - Each edge node keeps limited local storage; LRU keeps most recently requested objects nearby.
 
-The design uses two synchronized data structures:
+4. In-memory feature cache for ML inference
+   - Cache recent feature vectors or model outputs to reduce computation on hot items.
 
-1. A HashMap (key -> node) for O(1) lookup of nodes.
-2. A Doubly-Linked List to maintain usage order: head is most recently used (MRU), tail is least recently used (LRU).
+5. Session or token caches (short-lived)
+   - Cache authentication tokens or session blobs to avoid repeated store lookups.
 
-Rationale: A HashMap gives constant-time lookup, while the linked list preserves the order of recent accesses and supports O(1) insertion and removal when nodes are known.
+Industry note: For high-concurrency and large-scale systems prefer battle-tested cache libraries (Caffeine, Redis, memcached) or commercial CDN caches rather than naive home-grown implementations.
 
-Operations:
+## Goals, constraints, and non-goals
 
-- get(key): If key exists, move node to the head of the list and return its value. Otherwise return null (or Optional.empty(), or a sentinel like -1 depending on the API choice).
-- put(key, value): If key exists, update value and move node to head. If not, create node, insert at head. If capacity exceeded, remove tail node and delete from map.
-- remove(key): remove node from list and map if present.
-- clear(): remove all entries.
+Goals:
+- Provide bounded memory usage (capacity limit).
+- Fast operations for common paths (get, put, peek).
+- Deterministic eviction (LRU policy).
+- Clear operational metrics (hit/miss, evictions).
 
-## Data structures & algorithm
+Constraints:
+- Works in-memory on a single process or node by default.
+- Consistency between map and usage-order must be maintained.
 
-- Node: stores key, value, prev, next.
-- Map: HashMap<K, Node>.
-- List head/tail sentinel nodes simplify insertion/removal (avoid null checks).
+Non-goals:
+- Strong global consistency across many distributed nodes (LRU is primarily a local policy).
+- Long-term persistence — caches are ephemeral by nature.
 
-Eviction: Always remove the tail node (LRU) when size > capacity.
+## Core API and semantics
 
-## Java implementation
+An industry-standard minimal API (language-agnostic):
+- get(key): returns value or miss. Updates usage order.
+- put(key, value): insert or update; updates usage order and may trigger eviction.
+- peek(key): read without changing usage order (useful for monitoring or special cases).
+- remove(key): force remove from cache.
+- clear(): empty the cache.
+- meta/stats(): return metrics (hits, misses, evictions, size, capacity).
 
-Below is a complete, idiomatic Java implementation you can drop into src/main/java:
+Optional extensions:
+- putWithTTL(key, value, ttl): combine LRU and time-based expiry.
+- putIfAbsent, computeIfAbsent: atomic helpers to avoid stampedes.
 
-```java
-package com.example.cache;
+API semantics to define explicitly:
+- What constitutes an access that counts for LRU ordering (get, put, peek?).
+- Return semantics on miss (null vs Optional vs exception) and whether there is a backing load mechanism.
 
-import java.util.HashMap;
-import java.util.Map;
+Cache-aside vs write-through vs write-behind patterns (choose per consistency/performance needs):
+- Cache-aside (lazy load): application checks cache then loads from backing store on miss and populates cache. Simple, commonly used.
+- Write-through: writes update the cache and backing store synchronously. Simpler consistency but higher write latency.
+- Write-behind: writes return quickly and are persisted asynchronously; risk of lost updates on failure.
 
-public class LRUCache<K, V> {
-    private final int capacity;
-    private final Map<K, Node<K, V>> map;
-    private final Node<K, V> head; // dummy head
-    private final Node<K, V> tail; // dummy tail
+## System components and high-level architecture
 
-    private static class Node<K, V> {
-        K key;
-        V value;
-        Node<K, V> prev, next;
-        Node(K k, V v) { key = k; value = v; }
-    }
+Single-node (in-process) cache:
+- In-memory data structures: hashmap for key → entry, plus an order structure to track recency.
+- Cache manager: instrumentation, eviction trigger, TTL sweeper (if TTL used).
+- Optional loader: function to fetch values on miss.
 
-    public LRUCache(int capacity) {
-        if (capacity <= 0) throw new IllegalArgumentException("Capacity must be > 0");
-        this.capacity = capacity;
-        this.map = new HashMap<>(capacity);
-        head = new Node<>(null, null);
-        tail = new Node<>(null, null);
-        head.next = tail;
-        tail.prev = head;
-    }
+Service architecture examples:
+- Monolithic app: single-process LRU for per-instance caching.
+- Microservices: each instance has local LRU for hottest items + a distributed cache for shared large working sets.
 
-    public V get(K key) {
-        Node<K, V> node = map.get(key);
-        if (node == null) return null;
-        moveToHead(node);
-        return node.value;
-    }
+Design pattern: Typical deployment in front of the data source (cache-aside):
+- Client → Service (local LRU) → (if miss) → backing store (DB/remote cache/CDN) → Service (populate cache) → Client
 
-    public void put(K key, V value) {
-        Node<K, V> node = map.get(key);
-        if (node != null) {
-            node.value = value;
-            moveToHead(node);
-            return;
-        }
-        Node<K, V> newNode = new Node<>(key, value);
-        map.put(key, newNode);
-        addToHead(newNode);
-        if (map.size() > capacity) {
-            Node<K, V> lru = removeTail();
-            if (lru != null && lru.key != null) map.remove(lru.key);
-        }
-    }
+Consider centralizing metrics and health via an exporter (Prometheus) and expose endpoints for cache stats.
 
-    public V remove(K key) {
-        Node<K, V> node = map.remove(key);
-        if (node == null) return null;
-        removeNode(node);
-        return node.value;
-    }
+## Eviction strategy rationale and alternatives
 
-    public void clear() {
-        head.next = tail;
-        tail.prev = head;
-        map.clear();
-    }
+Why LRU?
+- Simple, easy to reason about, and effective when access patterns have temporal locality.
+- Deterministic and memory-bounded.
 
-    public int size() {
-        return map.size();
-    }
+Alternatives and when to choose them:
+- LFU (Least Frequently Used): better for long-term popularity tracking; more stateful and often more costly to maintain.
+- TinyLFU + LRU (e.g., Window TinyLFU in Caffeine): economical and better hit rates; recommended for large caches.
+- CLOCK: approximation of LRU with less overhead — used in OS-level page replacement.
+- Random or FIFO: sometimes acceptable for simple or write-heavy workloads.
 
-    private void addToHead(Node<K, V> node) {
-        node.next = head.next;
-        node.prev = head;
-        head.next.prev = node;
-        head.next = node;
-    }
+Industry practice: prefer well-tested cache implementations (e.g., Caffeine), which implement advanced hybrid policies like Window-TinyLFU to get better hit rates than pure LRU while keeping complexity manageable.
 
-    private void removeNode(Node<K, V> node) {
-        node.prev.next = node.next;
-        node.next.prev = node.prev;
-    }
+## Capacity planning and sizing examples
 
-    private void moveToHead(Node<K, V> node) {
-        removeNode(node);
-        addToHead(node);
-    }
+Key inputs:
+- Average entry size (S bytes) including overhead (object headers, pointers)
+- Target resident items (N)
+- Memory budget (M bytes)
 
-    private Node<K, V> removeTail() {
-        if (tail.prev == head) return null;
-        Node<K, V> lru = tail.prev;
-        removeNode(lru);
-        return lru;
-    }
-}
-```
+Simple sizing formula:
+- N = floor(M / S)
+- Choose capacity = N * safety_factor (e.g., 0.9) to leave headroom for GC and overhead.
 
-Usage example:
+Example:
+- Memory budget: 512 MB (536,870,912 bytes)
+- Average entry size: 2 KB (2048 bytes)
+- Maximum entries ≈ 536,870,912 / 2048 ≈ 262,144 entries
+- Choose capacity = 240,000 to leave headroom for JVM overhead and fragmentation.
 
-```java
-LRUCache<Integer, String> cache = new LRUCache<>(3);
-cache.put(1, "one");
-cache.put(2, "two");
-cache.put(3, "three");
-cache.get(2); // 2 becomes most recently used
-cache.put(4, "four"); // evicts key 1 (least recently used)
-```
+Monitoring tip: measure actual object sizes (heap profiling) and account for load factor in hash maps and linked-list overhead.
 
-If you prefer a simpler approach in some cases, Java's LinkedHashMap already implements access-order eviction; you can subclass it and override removeEldestEntry to enforce capacity.
+Eviction tuning:
+- Eviction triggers on insert when size > capacity. Consider soft limits and background trimming to avoid long pauses.
+- For large entries, consider weighted capacity (sum of weights) rather than count-based capacity.
 
-## Complexity
+## Distributed designs and scaling patterns
 
-- Time: O(1) average for get and put (hashmap + linked-list operations).
-- Space: O(capacity) for map + linked list nodes.
+Local caches per instance:
+- Pros: ultra-low latency, reduces cross-node network calls.
+- Cons: cache duplication, cold-starts, inconsistent views across nodes.
 
-## Concurrency considerations
+Shared distributed cache (e.g., Redis, Memcached):
+- Pros: single source of truth, easier to control global capacity.
+- Cons: network hop, operational complexity, and possible single points of failure.
 
-- Single-threaded: implementation above is sufficient.
-- Multi-threaded: options:
-  - Use external synchronization: synchronize public methods or use a ReentrantReadWriteLock to allow concurrent reads.
-  - Wrap a LinkedHashMap with Collections.synchronizedMap for coarse-grained safety.
-  - Use ConcurrentHashMap and implement a segmented LRU or use third-party libraries (Caffeine) for high-performance concurrent caches.
+Sharding approaches:
+- Client-side sharding (consistent hashing): distribute keys across cache nodes to scale capacity and throughput.
+- Centralized clustering: use a distributed cache with built-in clustering and replication.
 
-Be careful: making the linked list and map consistent across threads requires careful locking.
+Approximating LRU in distributed caches:
+- Global precise LRU is expensive. Instead use local LRU per shard or the distributed cache's internal eviction.
+- Consider lightweight frequency sketches (TinyLFU) to approximate popularity across nodes.
 
-## Testing & validation
+Cache coherence & consistency:
+- Cache invalidation: for write-heavy workloads, ensure invalidation is synchronous or use short TTLs.
+- Use message bus (Kafka) to broadcast invalidation events to nodes when underlying data changes.
 
-- Unit tests: basic get/put, eviction order, update existing key, capacity boundary.
-- Concurrency tests: multiple threads performing gets/puts; validate no corruption and correctness.
-- Property tests: random sequences of operations validated against a slow reference implementation.
+Example hybrid architecture:
+- Local LRU per instance for ultra-fast hits + Redis as a shared cache for larger or less frequently accessed items. Use a cache-aside pattern with backing store as the authoritative source.
 
-## Extensions & improvements
+## Operational concerns: metrics, monitoring, and SLAs
 
-- TTL (time-to-live) expiration for entries.
-- Weighted eviction (evict based on entry size instead of count).
-- Backing store (write-through/write-back) to persist evicted items.
-- Statistics/metrics: hit rate, miss rate, eviction count.
+Essential metrics to expose:
+- hit_count, miss_count, hit_rate
+- eviction_count, current_size, capacity
+- average_latency_get, p95_latency_get
+- load_success_count, load_failure_count (if async loader used)
+
+Health and alerts:
+- Alert on sudden increase in miss rate or eviction rate.
+- Alert on memory pressure or GC spikes if cache grows unexpectedly.
+
+Instrumentation tips:
+- Add Prometheus exporters for metrics.
+- Track sizes of entries and distribution to detect heavy entries.
+- Enable runtime dumping of top hot keys for debugging (careful with privacy/security).
+
+SLA considerations:
+- Define acceptable staleness (TTL) and miss penalties.
+- Consider fallbacks for the cache being unavailable (graceful degradation).
+
+## Failure modes and mitigation
+
+1. Memory exhaustion / OOM
+   - Use strict capacity limits, use eviction on insert, and consider eviction in background.
+   - Set process-level memory limits and monitor memory usage.
+
+2. Cache stampede (many clients miss same key)
+   - Use request coalescing / singleflight to ensure only one load is in-flight for a missing key.
+   - Use early recomputation or autoscaling of the backing store.
+
+3. Inconsistent data after writes
+   - Use explicit invalidation (synchronous) or rely on TTLs for eventual consistency.
+   - For critical data, consider write-through or transactional updates.
+
+4. Hot keys
+   - Detect hot keys and handle them specially (pinning, replication, or bypass to dedicated store).
+
+5. Serialization / object-bloat
+   - Ensure cached objects are memory-efficient and prefer compact serialized forms for shared caches.
 
 ## Flow diagrams (Mermaid)
 
-Get flow:
+Request/response with local LRU (cache-aside):
 
 ```mermaid
 flowchart TD
-  G[Get(key)] --> C{map.containsKey(key)?}
-  C -- Yes --> M[move node to head]
-  M --> R[return value]
-  C -- No --> RN[return null / miss]
+  Client --> Service[Service Instance]
+  Service -->|get(key)| LocalCache[Local LRU Cache]
+  LocalCache -->|hit| ServiceReturn[Return value]
+  LocalCache -->|miss| Backing[Backing Store / Remote Cache]
+  Backing -->|value| Service
+  Service -->|populate cache| LocalCache
+  Service -->|return| Client
 ```
 
-Put flow:
+Eviction lifecycle (single-node):
 
 ```mermaid
 flowchart TD
-  P[Put(key, value)] --> E{map.containsKey(key)?}
-  E -- Yes --> U[update value & move to head]
-  U --> D[done]
-  E -- No --> A[create node & add to head]
-  A --> S{map.size() > capacity?}
-  S -- Yes --> REM[remove tail node & map.remove(tail.key)] --> D
-  S -- No --> D
+  Put[put(key,value)] --> Check{size > capacity?}
+  Check -- No --> AddToCache[insert at MRU]
+  Check -- Yes --> Evict[remove LRU entry]
+  Evict --> AddToCache
 ```
 
-You can paste these Mermaid blocks into GitHub README.md; GitHub will render them as diagrams.
+Cache warm-up and prefetching example:
 
----
+```mermaid
+flowchart TD
+  Scheduler[Warm-up scheduler] --> KeyList[popular keys list]
+  KeyList -->|for each key| BackingStore
+  BackingStore -->|value| LocalCache
+```
 
-What I changed: I replaced the short README with a detailed design-focused README that explains what an LRU cache is, why to use it, design goals, a full Java implementation, usage examples, complexity, concurrency notes, testing ideas, and Mermaid flowcharts.
+## Next steps
 
-What's next: I can add a complete Java project skeleton (Maven or Gradle) with the LRUCache implementation under src/main/java and unit tests under src/test/java, or convert the implementation to use LinkedHashMap, or add concurrency-safe variants. Which would you like me to add next?
+I removed all code from the README and focused it into an industry-standard system design document with practical examples and operational guidance. Next, I can:
+
+- Generate a project skeleton (Maven or Gradle) and place interface definitions and tests in the repository.
+- Produce multiple cache variants as separate modules: in-process LRU, weighted-LRU, TTL-LRU, and a LinkedHashMap-based thin wrapper.
+- Create an architecture diagram (draw.io or higher-fidelity) and embed/export it for the repo.
+
+Which of the next steps would you like me to do now?
